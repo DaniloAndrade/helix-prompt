@@ -1,0 +1,7 @@
+{
+  "name": "helix-prompt",
+  "version": "0.1.0",
+  "description": "Helix-style modal editing (selection first, action after) in the Claude Code prompt box",
+  "author": { "name": "Danilo Andrade" },
+  "license": "MIT"
+}
