@@ -3,8 +3,9 @@ import type { Register } from 'claude-code'
 type Mode = 'insert' | 'normal' | 'select'
 type Sel = { anchor: number; head: number }
 type Box = { text: string; cursor: number; sel: Sel }
-// A key that waits for the next one: `g` goto, `m` match, `f`/`t`/`F`/`T` find a character
-type Pending = '' | 'g' | 'm' | 'f' | 't' | 'F' | 'T'
+// A key that waits for the next one: `g` goto, `m` match (`mi`/`ma` then pick a text object),
+// `f`/`t`/`F`/`T` find a character
+type Pending = '' | 'g' | 'm' | 'mi' | 'ma' | 'f' | 't' | 'F' | 'T'
 
 const SELECTION = { backgroundColor: 'blue' } as const
 const STATUS: Record<Mode, string | undefined> = {
@@ -22,6 +23,19 @@ const PAIRS = new Map([
   ['}', '{'],
 ])
 const OPENERS = '([{'
+// Text objects `mi`/`ma` take, by the key that names them (`b`, `B` are Helix's aliases)
+const OBJECT_PAIRS = new Map<string, readonly [string, string]>([
+  ['(', ['(', ')']],
+  [')', ['(', ')']],
+  ['b', ['(', ')']],
+  ['[', ['[', ']']],
+  [']', ['[', ']']],
+  ['{', ['{', '}']],
+  ['}', ['{', '}']],
+  ['B', ['{', '}']],
+  ['<', ['<', '>']],
+  ['>', ['<', '>']],
+])
 
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n))
 const isSpace = (c: string) => /\s/.test(c)
@@ -73,28 +87,143 @@ function prevWord(t: string, from: number): Sel {
   return { anchor: end, head: i }
 }
 
+// Index of the `other` that closes the `self` at `from`, scanning in `dir`, or -1
+function pairedWith(t: string, from: number, dir: 1 | -1, self: string, other: string): number {
+  let depth = 0
+  for (let i = from; i >= 0 && i < t.length; i += dir) {
+    const c = t.charAt(i)
+    if (c === self) depth++
+    else if (c === other && --depth === 0) return i
+  }
+  return -1
+}
+
 // Index of the bracket pairing the one at `at`, or -1
 function matchBracket(t: string, at: number): number {
   const open = t.charAt(at)
   const close = PAIRS.get(open)
   if (close === undefined) return -1
-  const dir = OPENERS.includes(open) ? 1 : -1
-  let depth = 0
-  for (let i = at; i >= 0 && i < t.length; i += dir) {
-    if (t.charAt(i) === open) depth++
-    else if (t.charAt(i) === close && --depth === 0) return i
-  }
-  return -1
+  return pairedWith(t, at, OPENERS.includes(open) ? 1 : -1, open, close)
 }
 
-// Index `f`/`t`/`F`/`T` lands on for `ch`, searching from `from`, or -1
-function findChar(t: string, from: number, ch: string, kind: 'f' | 't' | 'F' | 'T'): number {
-  if (kind === 'f' || kind === 't') {
-    const i = t.indexOf(ch, from + 1)
-    return i === -1 || kind === 'f' ? i : i - 1
+// Index `f`/`t`/`F`/`T` lands on for the `n`th `ch`, searching from `from`, or -1
+function findChar(t: string, from: number, ch: string, kind: 'f' | 't' | 'F' | 'T', n: number): number {
+  const isForward = kind === 'f' || kind === 't'
+  let at = from
+  for (let k = 0; k < n; k++) {
+    const i = isForward ? t.indexOf(ch, at + 1) : at === 0 ? -1 : t.lastIndexOf(ch, at - 1)
+    if (i === -1) return -1
+    at = i
   }
-  const i = from === 0 ? -1 : t.lastIndexOf(ch, from - 1)
-  return i === -1 || kind === 'F' ? i : i + 1
+  return kind === 't' ? at - 1 : kind === 'T' ? at + 1 : at
+}
+
+const isBlank = (c: string) => c === ' ' || c === '\t'
+
+// The word, or with `isBig` the run of non-space, under `at`; `around` takes the spaces after it
+// (before it when none follow)
+function wordObject(t: string, at: number, around: boolean, isBig: boolean): Sel | undefined {
+  if (at >= t.length) return undefined
+  const kind = (c: string) => (c === '\n' ? 3 : isSpace(c) ? 0 : isBig || isWord(c) ? 1 : 2)
+  const k = kind(t.charAt(at))
+  let anchor = at
+  let head = at
+  while (anchor > 0 && kind(t.charAt(anchor - 1)) === k) anchor--
+  while (head + 1 < t.length && kind(t.charAt(head + 1)) === k) head++
+  if (!around || k === 0 || k === 3) return { anchor, head }
+  if (isBlank(t.charAt(head + 1))) {
+    while (isBlank(t.charAt(head + 1))) head++
+  } else {
+    while (isBlank(t.charAt(anchor - 1))) anchor--
+  }
+  return { anchor, head }
+}
+
+// The text between the pair of `open`/`close` around `at` (nested pairs counted), or the pair too
+function pairObject(t: string, at: number, open: string, close: string, around: boolean): Sel | undefined {
+  const c = t.charAt(at)
+  let start = -1
+  if (c === open) {
+    start = at
+  } else if (c === close) {
+    start = pairedWith(t, at, -1, close, open)
+  } else {
+    let depth = 0
+    for (let i = at - 1; i >= 0; i--) {
+      const ch = t.charAt(i)
+      if (ch === close) depth++
+      else if (ch === open && depth-- === 0) {
+        start = i
+        break
+      }
+    }
+  }
+  if (start === -1) return undefined
+  const end = pairedWith(t, start, 1, open, close)
+  if (end === -1) return undefined
+  if (around) return { anchor: start, head: end }
+  return end - start > 1 ? { anchor: start + 1, head: end - 1 } : undefined
+}
+
+// The text between the quotes pairing up on the line around `at` (a backslash escapes a quote)
+function quoteObject(t: string, at: number, quote: string, around: boolean): Sel | undefined {
+  const from = lineStart(t, at)
+  const nl = t.indexOf('\n', at)
+  const marks: number[] = []
+  for (let i = from; i < (nl === -1 ? t.length : nl); i++) {
+    if (t.charAt(i) === quote && t.charAt(i - 1) !== '\\') marks.push(i)
+  }
+  let open = -1
+  for (const i of marks) {
+    if (open === -1) {
+      open = i
+      continue
+    }
+    if (open <= at && at <= i) {
+      if (around) return { anchor: open, head: i }
+      return i - open > 1 ? { anchor: open + 1, head: i - 1 } : undefined
+    }
+    open = -1
+  }
+  return undefined
+}
+
+// The lines around `at` up to the blank ones; `around` takes the blank lines after them too
+function paragraphObject(t: string, at: number, around: boolean): Sel | undefined {
+  const isBlankLine = (from: number, to: number) => t.slice(from, to).trim() === ''
+  const endOf = (from: number) => {
+    const nl = t.indexOf('\n', from)
+    return nl === -1 ? t.length : nl
+  }
+  let start = lineStart(t, at)
+  let end = endOf(at)
+  if (isBlankLine(start, end)) return undefined
+  while (start > 0 && !isBlankLine(lineStart(t, start - 1), start - 1)) start = lineStart(t, start - 1)
+  while (end < t.length && !isBlankLine(end + 1, endOf(end + 1))) end = endOf(end + 1)
+  let head = end - 1
+  if (around) {
+    while (end < t.length && isBlankLine(end + 1, endOf(end + 1))) end = endOf(end + 1)
+    head = Math.min(end, t.length - 1)
+  }
+  return { anchor: start, head }
+}
+
+function textObject(t: string, at: number, key: string, around: boolean): Sel | undefined {
+  switch (key) {
+    case 'w':
+    case 'W':
+      return wordObject(t, at, around, key === 'W')
+    case '"':
+    case "'":
+    case '`':
+      return quoteObject(t, at, key, around)
+    case 'p':
+      return paragraphObject(t, at, around)
+    default: {
+      const pair = OBJECT_PAIRS.get(key)
+      return pair && pairObject(t, at, pair[0], pair[1], around)
+    }
+  }
 }
 
 function vertical(t: string, head: number, dir: 1 | -1): number {
@@ -128,6 +257,8 @@ export const register: Register = (on) => {
   let sel: Sel = caret(0)
   let yanked = ''
   let pending: Pending = ''
+  // Digits typed so far, the repeat count for the next motion (0 when none)
+  let count = 0
   // Drafts to return to with `u`, and the ones `u` stepped back from, for `U`
   const past: Box[] = []
   const future: Box[] = []
@@ -143,10 +274,10 @@ export const register: Register = (on) => {
 
   // Pops snapshots off `from` until one differs from the draft (entering insert and leaving
   // it unchanged leaves a duplicate), parking the draft on `to`
-  const travel = (from: Box[], to: Box[], text: string): Box | undefined => {
+  const travel = (from: Box[], to: Box[], current: Box): Box | undefined => {
     for (let snap = from.pop(); snap; snap = from.pop()) {
-      if (snap.text === text) continue
-      to.push({ text, cursor: sel.head, sel })
+      if (snap.text === current.text) continue
+      to.push(current)
       return snap
     }
     return undefined
@@ -163,11 +294,37 @@ export const register: Register = (on) => {
 
     const waiting = pending
     pending = ''
+    const given = count
+    if (waiting === '' && /^[0-9]$/.test(key) && (key !== '0' || given > 0)) {
+      count = given * 10 + Number(key)
+      return keep(sel)
+    }
+    // The count rides through a prefix key (`3gg`, `2fx`) and is spent by the key that completes it
+    if (waiting !== '' || !'gmftFT'.includes(key) || key === '') count = 0
+    const n = Math.max(given, 1)
+
+    // Runs a word motion `n` times: the selection spans from the first word's start to the last's end
+    const sweep = (step: (t: string, from: number) => Sel): Sel => {
+      let first: Sel | undefined
+      let at = sel.head
+      for (let k = 0; k < n; k++) {
+        const w = step(text, at)
+        first ??= w
+        if (w.head === at) break
+        at = w.head
+      }
+      return { anchor: isExtending ? sel.anchor : (first ?? caret(at)).anchor, head: at }
+    }
+
     if (waiting !== '' && key !== 'escape') {
       if (waiting === 'g') {
         switch (key) {
-          case 'g':
-            return keep(move(caret(0)))
+          case 'g': {
+            // With a count, `gg` goes to that line
+            let at = 0
+            for (let k = 1; k < given && text.indexOf('\n', at) !== -1; k++) at = text.indexOf('\n', at) + 1
+            return keep(move(caret(Math.min(at, last))))
+          }
           case 'e':
             return keep(move(caret(last)))
           case 'h':
@@ -179,10 +336,17 @@ export const register: Register = (on) => {
         }
       }
       if (waiting === 'm') {
+        if (key === 'i' || key === 'a') {
+          pending = key === 'i' ? 'mi' : 'ma'
+          return keep(sel)
+        }
         const at = key === 'm' ? matchBracket(text, sel.head) : -1
         return keep(at === -1 ? sel : move(caret(at)))
       }
-      const at = key.length === 1 ? findChar(text, sel.head, key, waiting) : -1
+      if (waiting === 'mi' || waiting === 'ma') {
+        return keep(textObject(text, sel.head, key, waiting === 'ma') ?? sel)
+      }
+      const at = key.length === 1 ? findChar(text, sel.head, key, waiting, n) : -1
       if (at === -1) return keep(sel)
       return keep({ anchor: isExtending ? sel.anchor : sel.head, head: at })
     }
@@ -190,32 +354,26 @@ export const register: Register = (on) => {
     switch (key) {
       case 'h':
       case 'left':
-        return keep(move(caret(clamp(sel.head - 1, 0, last))))
+        return keep(move(caret(clamp(sel.head - n, 0, last))))
       case 'l':
       case 'right':
-        return keep(move(caret(clamp(sel.head + 1, 0, last))))
+        return keep(move(caret(clamp(sel.head + n, 0, last))))
       case 'j':
       case 'down':
-        return keep(move(caret(vertical(text, sel.head, 1))))
+        return keep(move(caret(Array.from({ length: n }).reduce<number>((h) => vertical(text, h, 1), sel.head))))
       case 'k':
       case 'up':
-        return keep(move(caret(vertical(text, sel.head, -1))))
+        return keep(move(caret(Array.from({ length: n }).reduce<number>((h) => vertical(text, h, -1), sel.head))))
       case '0':
         return keep(move(caret(lineStart(text, sel.head))))
       case '$':
         return keep(move(caret(lineLast(text, sel.head))))
-      case 'w': {
-        const w = nextWord(text, sel.head)
-        return keep(isExtending ? { anchor: sel.anchor, head: w.head } : w)
-      }
-      case 'e': {
-        const w = wordEnd(text, sel.head)
-        return keep(isExtending ? { anchor: sel.anchor, head: w.head } : w)
-      }
-      case 'b': {
-        const w = prevWord(text, sel.head)
-        return keep(isExtending ? { anchor: sel.anchor, head: w.head } : w)
-      }
+      case 'w':
+        return keep(sweep(nextWord))
+      case 'e':
+        return keep(sweep(wordEnd))
+      case 'b':
+        return keep(sweep(prevWord))
       case 'g':
       case 'm':
       case 'f':
@@ -227,7 +385,7 @@ export const register: Register = (on) => {
       case '%':
         return keep({ anchor: 0, head: last })
       case 'x':
-        return keep(selectLine(text, sel))
+        return keep(Array.from({ length: n }).reduce<Sel>((s) => selectLine(text, s), sel))
       case 'v':
         return { ...keep(sel), to: isExtending ? 'normal' : 'select' }
       case 'escape':
@@ -263,8 +421,14 @@ export const register: Register = (on) => {
         return { ...keep(sel), cursor: hi + 1, to: 'insert' }
       case 'u':
       case 'U': {
-        const snap = key === 'u' ? travel(past, future, text) : travel(future, past, text)
-        return snap ? { ...snap, cursor: snap.sel.head } : keep(sel)
+        const [from, to] = key === 'u' ? [past, future] : [future, past]
+        let current: Box = { text, cursor: sel.head, sel }
+        for (let k = 0; k < n; k++) {
+          const snap = travel(from, to, current)
+          if (!snap) break
+          current = { ...snap, cursor: snap.sel.head }
+        }
+        return current
       }
       default:
         return keep(sel)

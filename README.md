@@ -25,6 +25,7 @@ The prompt starts in **insert** mode. Type `jk` to enter **normal** mode (`Esc` 
 | `gh` `gl` | line start / end |
 | `f`/`t` + char | select to / till the next char; `F`/`T` search backwards |
 | `mm` | jump to the matching `()` `[]` `{}` |
+| `mi` / `ma` + object | select inside / around: `w` word, `W` WORD, `(` `)` `b`, `[` `]`, `{` `}` `B`, `<` `>`, `"` `'` `` ` ``, `p` paragraph |
 | `x` | select line (repeat to extend) |
 | `%` | select everything |
 | `v` | toggle select mode (motions extend the selection) |
@@ -34,11 +35,14 @@ The prompt starts in **insert** mode. Type `jk` to enter **normal** mode (`Esc` 
 | `o` `O` | open a line below / above and insert |
 | `u` `U` | undo / redo (an insert session is one step) |
 
+A number before a motion repeats it: `3w` selects three words, `2fx` finds the second `x`, `4j` moves four lines down, `2x` selects two lines, `2gg` goes to line 2, `2u` undoes two steps. `Esc` drops a pending count or prefix.
+
 Unknown keys in normal mode are ignored.
 
 ## Limitations
 
-- Single selection, no multi-cursor, no counts, no text objects.
+- Single selection, no multi-cursor.
+- Counts apply to motions, `x`, `gg` and `u`/`U`; `d`, `c`, `y`, `p`, `o` ignore them.
 - Undo history lives in the mod and resets when the prompt is submitted.
 - Words are Unicode-aware (`ação` is one word); surrogate pairs (emoji) are not handled.
 - Mod API is early access and may change between Claude Code releases.
