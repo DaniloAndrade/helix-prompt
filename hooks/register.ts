@@ -90,15 +90,24 @@ function wordEnd(t: string, from: number): Sel {
   return { anchor: continuesWord ? from : start, head: i }
 }
 
+// Helix's `b`, the mirror of `w`: the word or punctuation run with the blanks before it. Mid-word
+// the selection starts at the cursor; from a word's first character, or from blanks, it starts at
+// the previous one.
 function prevWord(t: string, from: number): Sel {
-  // Mid-word, the character under the cursor belongs to the selection
-  const isInsideWord = from > 0 && !isSpace(t.charAt(from)) && isWord(t.charAt(from - 1)) === isWord(t.charAt(from)) && !isSpace(t.charAt(from - 1))
-  let i = from - 1
-  while (i >= 0 && isSpace(t.charAt(i))) i--
-  if (i < 0) return caret(0)
-  const end = isInsideWord ? from : i
-  while (i - 1 >= 0 && !isSpace(t.charAt(i - 1)) && isWord(t.charAt(i - 1)) === isWord(t.charAt(end))) i--
-  return { anchor: end, head: i }
+  if (from === 0) return caret(0)
+  const k = kindOf(t.charAt(from))
+  const isRun = k === 1 || k === 2
+  const isMidWord = isRun && kindOf(t.charAt(from - 1)) === k
+  // A one-character word after blanks is still a whole word, and taking them moves on
+  const isLone = isRun && !isMidWord && kindOf(t.charAt(from + 1)) !== k && isBlank(t.charAt(from - 1))
+  const anchor = isMidWord || isLone ? from : from - 1
+  const kind = kindOf(t.charAt(anchor))
+  let head = anchor
+  while (head > 0 && kindOf(t.charAt(head - 1)) === kind) head--
+  if (kind === 1 || kind === 2) {
+    while (isBlank(t.charAt(head - 1))) head--
+  }
+  return { anchor, head }
 }
 
 // Index of the `other` that closes the `self` at `from`, scanning in `dir`, or -1

@@ -20,7 +20,8 @@ The prompt starts in **insert** mode. Type `jk` to enter **normal** mode (`Esc` 
 | --- | --- |
 | `h` `j` `k` `l`, arrows | move |
 | `0` `$` | line start / end |
-| `w` `e` `b` | select next word with its trailing blanks / to word end / previous word |
+| `w` `b` | select the next word with its trailing blanks / the previous word with its leading blanks |
+| `e` | select to the end of the word |
 | `gg` `ge` | start / end of the text |
 | `gh` `gl` | line start / end |
 | `f`/`t` + char | select to / till the next char; `F`/`T` search backwards |
