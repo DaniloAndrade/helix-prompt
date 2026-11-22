@@ -3,6 +3,8 @@ import type { Register } from 'claude-code'
 type Mode = 'insert' | 'normal' | 'select'
 type Sel = { anchor: number; head: number }
 type Box = { text: string; cursor: number; sel: Sel }
+// A key that waits for the next one: `g` goto, `m` match, `f`/`t`/`F`/`T` find a character
+type Pending = '' | 'g' | 'm' | 'f' | 't' | 'F' | 'T'
 
 const SELECTION = { backgroundColor: 'blue' } as const
 const STATUS: Record<Mode, string | undefined> = {
@@ -10,6 +12,16 @@ const STATUS: Record<Mode, string | undefined> = {
   normal: '-- NORMAL --',
   select: '-- SELECT --',
 }
+const HISTORY_LIMIT = 100
+const PAIRS = new Map([
+  ['(', ')'],
+  ['[', ']'],
+  ['{', '}'],
+  [')', '('],
+  [']', '['],
+  ['}', '{'],
+])
+const OPENERS = '([{'
 
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n))
 const isSpace = (c: string) => /\s/.test(c)
@@ -21,28 +33,68 @@ const lineEnd = (t: string, i: number) => {
   const n = t.indexOf('\n', i)
   return n === -1 ? t.length - 1 : n
 }
+// Index of the last character on the line, not counting its newline
+const lineLast = (t: string, i: number) => {
+  const end = lineEnd(t, i)
+  return t.charAt(end) === '\n' && end > lineStart(t, i) ? end - 1 : end
+}
 
 const bounds = (s: Sel) => ({ lo: Math.min(s.anchor, s.head), hi: Math.max(s.anchor, s.head) })
 const caret = (head: number): Sel => ({ anchor: head, head })
 
 function nextWord(t: string, from: number): Sel {
   let i = from + 1
-  while (i < t.length && isSpace(t[i])) i++
+  while (i < t.length && isSpace(t.charAt(i))) i++
   if (i >= t.length) return caret(t.length - 1)
   const start = i
-  while (i + 1 < t.length && !isSpace(t[i + 1]) && isWord(t[i + 1]) === isWord(t[start])) i++
+  while (i + 1 < t.length && !isSpace(t.charAt(i + 1)) && isWord(t.charAt(i + 1)) === isWord(t.charAt(start))) i++
   return { anchor: start, head: i }
+}
+
+function wordEnd(t: string, from: number): Sel {
+  let i = from + 1
+  while (i < t.length && isSpace(t.charAt(i))) i++
+  if (i >= t.length) return caret(t.length - 1)
+  const start = i
+  while (i + 1 < t.length && !isSpace(t.charAt(i + 1)) && isWord(t.charAt(i + 1)) === isWord(t.charAt(start))) i++
+  // Mid-word, the selection runs on from the cursor instead of skipping to the next word
+  const continuesWord = start === from + 1 && !isSpace(t.charAt(from)) && isWord(t.charAt(from)) === isWord(t.charAt(start))
+  return { anchor: continuesWord ? from : start, head: i }
 }
 
 function prevWord(t: string, from: number): Sel {
   // Mid-word, the character under the cursor belongs to the selection
-  const isInsideWord = from > 0 && !isSpace(t[from]) && isWord(t[from - 1]) === isWord(t[from]) && !isSpace(t[from - 1])
+  const isInsideWord = from > 0 && !isSpace(t.charAt(from)) && isWord(t.charAt(from - 1)) === isWord(t.charAt(from)) && !isSpace(t.charAt(from - 1))
   let i = from - 1
-  while (i >= 0 && isSpace(t[i])) i--
+  while (i >= 0 && isSpace(t.charAt(i))) i--
   if (i < 0) return caret(0)
   const end = isInsideWord ? from : i
-  while (i - 1 >= 0 && !isSpace(t[i - 1]) && isWord(t[i - 1]) === isWord(t[end])) i--
+  while (i - 1 >= 0 && !isSpace(t.charAt(i - 1)) && isWord(t.charAt(i - 1)) === isWord(t.charAt(end))) i--
   return { anchor: end, head: i }
+}
+
+// Index of the bracket pairing the one at `at`, or -1
+function matchBracket(t: string, at: number): number {
+  const open = t.charAt(at)
+  const close = PAIRS.get(open)
+  if (close === undefined) return -1
+  const dir = OPENERS.includes(open) ? 1 : -1
+  let depth = 0
+  for (let i = at; i >= 0 && i < t.length; i += dir) {
+    if (t.charAt(i) === open) depth++
+    else if (t.charAt(i) === close && --depth === 0) return i
+  }
+  return -1
+}
+
+// Index `f`/`t`/`F`/`T` lands on for `ch`, searching from `from`, or -1
+function findChar(t: string, from: number, ch: string, kind: 'f' | 't' | 'F' | 'T'): number {
+  if (kind === 'f' || kind === 't') {
+    const i = t.indexOf(ch, from + 1)
+    return i === -1 || kind === 'f' ? i : i - 1
+  }
+  const i = from === 0 ? -1 : t.lastIndexOf(ch, from - 1)
+  return i === -1 || kind === 'F' ? i : i + 1
 }
 
 function vertical(t: string, head: number, dir: 1 | -1): number {
@@ -50,7 +102,7 @@ function vertical(t: string, head: number, dir: 1 | -1): number {
   let start: number
   if (dir === 1) {
     const end = lineEnd(t, head)
-    if (t[end] !== '\n') return head
+    if (t.charAt(end) !== '\n') return head
     start = Math.min(end + 1, t.length - 1)
   } else {
     const own = lineStart(t, head)
@@ -64,7 +116,7 @@ function vertical(t: string, head: number, dir: 1 | -1): number {
 
 function selectLine(t: string, s: Sel): Sel {
   const { lo, hi } = bounds(s)
-  const isWholeLines = lo === lineStart(t, lo) && (hi === t.length - 1 || t[hi] === '\n')
+  const isWholeLines = lo === lineStart(t, lo) && (hi === t.length - 1 || t.charAt(hi) === '\n')
   if (isWholeLines && hi + 1 < t.length && lo !== hi + 1) {
     return { anchor: lo, head: lineEnd(t, hi + 1) }
   }
@@ -75,6 +127,10 @@ export const register: Register = (on) => {
   let mode: Mode = 'insert'
   let sel: Sel = caret(0)
   let yanked = ''
+  let pending: Pending = ''
+  // Drafts to return to with `u`, and the ones `u` stepped back from, for `U`
+  const past: Box[] = []
+  const future: Box[] = []
 
   const view = (b: Box) => ({
     text: b.text,
@@ -85,6 +141,17 @@ export const register: Register = (on) => {
         : [{ start: bounds(b.sel).lo, end: bounds(b.sel).hi + 1, ...SELECTION }],
   })
 
+  // Pops snapshots off `from` until one differs from the draft (entering insert and leaving
+  // it unchanged leaves a duplicate), parking the draft on `to`
+  const travel = (from: Box[], to: Box[], text: string): Box | undefined => {
+    for (let snap = from.pop(); snap; snap = from.pop()) {
+      if (snap.text === text) continue
+      to.push({ text, cursor: sel.head, sel })
+      return snap
+    }
+    return undefined
+  }
+
   // Applies one normal/select-mode key to the draft; returns the new draft
   const command = (key: string, text: string): Box & { to?: Mode } => {
     const isExtending = mode === 'select'
@@ -92,14 +159,41 @@ export const register: Register = (on) => {
       isExtending ? { anchor: sel.anchor, head } : target
     const keep = (s: Sel): Box => ({ text, cursor: s.head, sel: s })
     const { lo, hi } = bounds(sel)
+    const last = Math.max(text.length - 1, 0)
+
+    const waiting = pending
+    pending = ''
+    if (waiting !== '' && key !== 'escape') {
+      if (waiting === 'g') {
+        switch (key) {
+          case 'g':
+            return keep(move(caret(0)))
+          case 'e':
+            return keep(move(caret(last)))
+          case 'h':
+            return keep(move(caret(lineStart(text, sel.head))))
+          case 'l':
+            return keep(move(caret(lineLast(text, sel.head))))
+          default:
+            return keep(sel)
+        }
+      }
+      if (waiting === 'm') {
+        const at = key === 'm' ? matchBracket(text, sel.head) : -1
+        return keep(at === -1 ? sel : move(caret(at)))
+      }
+      const at = key.length === 1 ? findChar(text, sel.head, key, waiting) : -1
+      if (at === -1) return keep(sel)
+      return keep({ anchor: isExtending ? sel.anchor : sel.head, head: at })
+    }
 
     switch (key) {
       case 'h':
       case 'left':
-        return keep(move(caret(clamp(sel.head - 1, 0, text.length - 1))))
+        return keep(move(caret(clamp(sel.head - 1, 0, last))))
       case 'l':
       case 'right':
-        return keep(move(caret(clamp(sel.head + 1, 0, text.length - 1))))
+        return keep(move(caret(clamp(sel.head + 1, 0, last))))
       case 'j':
       case 'down':
         return keep(move(caret(vertical(text, sel.head, 1))))
@@ -108,18 +202,30 @@ export const register: Register = (on) => {
         return keep(move(caret(vertical(text, sel.head, -1))))
       case '0':
         return keep(move(caret(lineStart(text, sel.head))))
-      case '$': {
-        const end = lineEnd(text, sel.head)
-        return keep(move(caret(text[end] === '\n' && end > 0 ? end - 1 : end)))
-      }
+      case '$':
+        return keep(move(caret(lineLast(text, sel.head))))
       case 'w': {
         const w = nextWord(text, sel.head)
+        return keep(isExtending ? { anchor: sel.anchor, head: w.head } : w)
+      }
+      case 'e': {
+        const w = wordEnd(text, sel.head)
         return keep(isExtending ? { anchor: sel.anchor, head: w.head } : w)
       }
       case 'b': {
         const w = prevWord(text, sel.head)
         return keep(isExtending ? { anchor: sel.anchor, head: w.head } : w)
       }
+      case 'g':
+      case 'm':
+      case 'f':
+      case 't':
+      case 'F':
+      case 'T':
+        pending = key
+        return keep(sel)
+      case '%':
+        return keep({ anchor: 0, head: last })
       case 'x':
         return keep(selectLine(text, sel))
       case 'v':
@@ -142,21 +248,35 @@ export const register: Register = (on) => {
         const pasted = { anchor: hi + 1, head: hi + yanked.length }
         return { text: next, cursor: pasted.head, sel: pasted, to: 'normal' }
       }
+      case 'o': {
+        const end = lineEnd(text, hi)
+        const at = text.charAt(end) === '\n' ? end : text.length
+        return { text: text.slice(0, at) + '\n' + text.slice(at), cursor: at + 1, sel: caret(at + 1), to: 'insert' }
+      }
+      case 'O': {
+        const at = lineStart(text, lo)
+        return { text: text.slice(0, at) + '\n' + text.slice(at), cursor: at, sel: caret(at), to: 'insert' }
+      }
       case 'i':
         return { ...keep(sel), cursor: lo, to: 'insert' }
       case 'a':
         return { ...keep(sel), cursor: hi + 1, to: 'insert' }
+      case 'u':
+      case 'U': {
+        const snap = key === 'u' ? travel(past, future, text) : travel(future, past, text)
+        return snap ? { ...snap, cursor: snap.sel.head } : keep(sel)
+      }
       default:
         return keep(sel)
     }
   }
 
   on('prompt.edit', async ($, e, next) => {
-    const key = e.key?.key
+    const raw = e.key?.key ?? ''
 
     if (mode === 'insert') {
       // Escape may never reach this hook, so "jk" typed in a row leaves insert mode
-      const isJk = key === 'k' && e.inputText === 'k' && e.text[e.start - 1] === 'j' && !e.key?.ctrl
+      const isJk = raw === 'k' && e.inputText === 'k' && e.text.charAt(e.start - 1) === 'j' && !e.key?.ctrl
       if (!isJk) return next(e)
 
       const text = e.text.slice(0, e.start - 1) + e.text.slice(e.start)
@@ -169,8 +289,19 @@ export const register: Register = (on) => {
 
     // Normal and select mode consume every key; unknown ones leave the draft untouched
     const text = e.text
+    const key = e.key?.ctrl || e.key?.meta ? '' : e.key?.shift && raw.length === 1 ? raw.toUpperCase() : raw
     sel = { anchor: clamp(sel.anchor, 0, text.length - 1), head: clamp(sel.head, 0, text.length - 1) }
-    const out = command(e.key?.ctrl || e.key?.meta ? '' : (key ?? ''), text)
+    const before: Box = { text, cursor: sel.head, sel }
+    const isTravel = pending === '' && (key === 'u' || key === 'U')
+    const out = command(key, text)
+
+    // An edit, or entering insert (whose typing follows), is one step back for `u`
+    if (!isTravel && (out.text !== text || out.to === 'insert')) {
+      past.push(before)
+      future.length = 0
+      if (past.length > HISTORY_LIMIT) past.shift()
+    }
+
     sel = out.sel
     if (out.to) {
       mode = out.to
@@ -180,6 +311,8 @@ export const register: Register = (on) => {
   })
 
   on('prompt.submit', ($, e, next) => {
+    past.length = 0
+    future.length = 0
     if (mode !== 'insert') {
       mode = 'insert'
       $.ui.status(STATUS.insert)
