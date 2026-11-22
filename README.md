@@ -35,6 +35,12 @@ The prompt starts in **insert** mode. Type `jk` to enter **normal** mode (`Esc` 
 | `i` `a` | insert before / after the selection |
 | `o` `O` | open a line below / above and insert |
 | `u` `U` | undo / redo (an insert session is one step) |
+| `s` + char | select every occurrence of the char inside the selections |
+| `C` | copy the selection to the next line (repeat or `3C` for more lines) |
+| `;` `,` | collapse the selections to cursors / keep only the primary one |
+| `(` `)` | make the previous / next selection the primary one |
+
+With several selections every motion and edit applies to all of them, `i` `a` `c` `o` `O` type at every cursor, and the status line shows how many there are. The primary selection is blue, the others cyan. Selections that overlap merge.
 
 A number before a motion repeats it: `3w` selects three words, `2fx` finds the second `x`, `4j` moves four lines down, `2x` selects two lines, `2gg` goes to line 2, `2u` undoes two steps. `Esc` drops a pending count or prefix.
 
@@ -42,7 +48,8 @@ Unknown keys in normal mode are ignored.
 
 ## Limitations
 
-- Single selection, no multi-cursor.
+- Multi-selection is built with `s` (one literal character, no regex) and `C`; there is no `S` split and no way to drop just the primary selection.
+- Several cursors typing: Backspace past the text typed in the same session reaches the neighbouring cursor's text.
 - Counts apply to motions, `x`, `gg` and `u`/`U`; `d`, `c`, `y`, `p`, `o` ignore them.
 - Undo history lives in the mod and resets when the prompt is submitted.
 - Words are Unicode-aware (`ação` is one word); surrogate pairs (emoji) are not handled.

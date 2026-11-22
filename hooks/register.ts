@@ -2,12 +2,17 @@ import type { Register } from 'claude-code'
 
 type Mode = 'insert' | 'normal' | 'select'
 type Sel = { anchor: number; head: number }
-type Box = { text: string; cursor: number; sel: Sel }
+// The draft and its selections, sorted and apart; `primary` indexes the one `cursor` follows
+type Box = { text: string; cursor: number; sels: Sel[]; primary: number }
+type Out = Box & { to?: Mode }
+// Replaces [start, end) with `insert`; the selection lands relative to where `insert` begins
+type Edit = { start: number; end: number; insert: string; anchorRel: number; headRel: number }
 // A key that waits for the next one: `g` goto, `m` match (`mi`/`ma` then pick a text object),
-// `f`/`t`/`F`/`T` find a character
-type Pending = '' | 'g' | 'm' | 'mi' | 'ma' | 'f' | 't' | 'F' | 'T'
+// `f`/`t`/`F`/`T` find a character, `s` select every occurrence of one inside the selections
+type Pending = '' | 'g' | 'm' | 'mi' | 'ma' | 'f' | 't' | 'F' | 'T' | 's'
 
-const SELECTION = { backgroundColor: 'blue' } as const
+const PRIMARY = { backgroundColor: 'blue' } as const
+const SECONDARY = { backgroundColor: 'cyan' } as const
 const STATUS: Record<Mode, string | undefined> = {
   insert: undefined,
   normal: '-- NORMAL --',
@@ -273,16 +278,76 @@ function selectLine(t: string, s: Sel): Sel {
   return { anchor: lineStart(t, s.head), head: lineEnd(t, s.head) }
 }
 
+// Sorts the selections and merges the ones that overlap (the merged one keeps the first one's
+// direction); the primary follows whichever selection absorbed it
+function normalize(sels: Sel[], primary: number): { sels: Sel[]; primary: number } {
+  const items = sels.map((sel, i) => ({ sel, isPrimary: i === primary }))
+  items.sort((a, b) => bounds(a.sel).lo - bounds(b.sel).lo || bounds(a.sel).hi - bounds(b.sel).hi)
+  const merged: typeof items = []
+  for (const item of items) {
+    const prev = merged[merged.length - 1]
+    if (!prev || bounds(item.sel).lo > bounds(prev.sel).hi) {
+      merged.push({ ...item })
+      continue
+    }
+    const lo = bounds(prev.sel).lo
+    const hi = Math.max(bounds(prev.sel).hi, bounds(item.sel).hi)
+    prev.sel = prev.sel.anchor <= prev.sel.head ? { anchor: lo, head: hi } : { anchor: hi, head: lo }
+    prev.isPrimary ||= item.isPrimary
+  }
+  return { sels: merged.map((m) => m.sel), primary: Math.max(0, merged.findIndex((m) => m.isPrimary)) }
+}
+
+// Applies edits that come in ascending order (one overlapping the one before is cut short) and
+// returns where each selection lands in the new text
+function applyEdits(t: string, edits: Edit[]): { text: string; sels: Sel[] } {
+  let text = ''
+  let at = 0
+  const sels: Sel[] = []
+  for (const e of edits) {
+    const start = Math.max(e.start, at)
+    text += t.slice(at, start)
+    const origin = text.length
+    text += e.insert
+    at = Math.max(e.end, start)
+    sels.push({ anchor: origin + e.anchorRel, head: origin + e.headRel })
+  }
+  return { text: text + t.slice(at), sels }
+}
+
+// The same column one line down, or undefined on the last line
+function lineBelow(t: string, i: number): number | undefined {
+  const nl = t.indexOf('\n', i)
+  if (nl === -1) return undefined
+  const start = nl + 1
+  const next = t.indexOf('\n', start)
+  const last = (next === -1 ? t.length : next) - 1
+  return clamp(start + i - lineStart(t, i), start, Math.max(start, last))
+}
+
+
 export const register: Register = (on) => {
   let mode: Mode = 'insert'
-  let sel: Sel = caret(0)
-  let yanked = ''
+  let sels: Sel[] = [caret(0)]
+  let primary = 0
+  // What `y`, `d` and `c` took, one entry per selection
+  let yanked: string[] = []
   let pending: Pending = ''
   // Digits typed so far, the repeat count for the next motion (0 when none)
   let count = 0
   // Drafts to return to with `u`, and the ones `u` stepped back from, for `U`
   const past: Box[] = []
   const future: Box[] = []
+  let shown: string | undefined
+
+  const label = () => (sels.length > 1 ? `-- ${mode.toUpperCase()} (${sels.length}) --` : STATUS[mode])
+  // Whether the status line needs a new text
+  const hasNewLabel = () => {
+    const next = label()
+    if (next === shown) return false
+    shown = next
+    return true
+  }
 
   const view = (b: Box) => ({
     text: b.text,
@@ -290,8 +355,18 @@ export const register: Register = (on) => {
     decorations:
       mode === 'insert' || b.text === ''
         ? []
-        : [{ start: bounds(b.sel).lo, end: bounds(b.sel).hi + 1, ...SELECTION }],
+        : b.sels.map((s, i) => ({ start: bounds(s).lo, end: bounds(s).hi + 1, ...(i === b.primary ? PRIMARY : SECONDARY) })),
   })
+
+  // Sorts and merges the selections; outside insert mode they stay on characters of the draft
+  const commit = (text: string, next: Sel[], nextPrimary: number, to?: Mode): Out => {
+    const top = Math.max(text.length - 1, 0)
+    const isInserting = (to ?? mode) === 'insert'
+    const placed = isInserting ? next : next.map((s) => ({ anchor: clamp(s.anchor, 0, top), head: clamp(s.head, 0, top) }))
+    const merged = normalize(placed, nextPrimary)
+    const cursor = (merged.sels[merged.primary] ?? caret(0)).head
+    return { text, cursor, sels: merged.sels, primary: merged.primary, to }
+  }
 
   // Pops snapshots off `from` until one differs from the draft (entering insert and leaving
   // it unchanged leaves a duplicate), parking the draft on `to`
@@ -304,37 +379,54 @@ export const register: Register = (on) => {
     return undefined
   }
 
-  // Applies one normal/select-mode key to the draft; returns the new draft
-  const command = (key: string, text: string): Box & { to?: Mode } => {
+  // Applies one normal/select-mode key to every selection of the draft
+  const command = (key: string, text: string): Out => {
     const isExtending = mode === 'select'
-    const move = (target: Sel, head = target.head): Sel =>
-      isExtending ? { anchor: sel.anchor, head } : target
-    const keep = (s: Sel): Box => ({ text, cursor: s.head, sel: s })
-    const { lo, hi } = bounds(sel)
     const last = Math.max(text.length - 1, 0)
+    const keep = () => commit(text, sels, primary)
+    const each = (fn: (s: Sel) => Sel, to?: Mode) => commit(text, sels.map(fn), primary, to)
+    const main = sels[primary] ?? caret(0)
+    const moveTo = (s: Sel, head: number): Sel => (isExtending ? { anchor: s.anchor, head } : caret(head))
 
     const waiting = pending
     pending = ''
     const given = count
     if (waiting === '' && /^[0-9]$/.test(key) && (key !== '0' || given > 0)) {
       count = given * 10 + Number(key)
-      return keep(sel)
+      return keep()
     }
     // The count rides through a prefix key (`3gg`, `2fx`) and is spent by the key that completes it
-    if (waiting !== '' || !'gmftFT'.includes(key) || key === '') count = 0
+    if (waiting !== '' || !'gmftFTs'.includes(key) || key === '') count = 0
     const n = Math.max(given, 1)
 
+    const vertically = (head: number, dir: 1 | -1) =>
+      Array.from({ length: n }).reduce<number>((h) => vertical(text, h, dir), head)
+
     // Runs a word motion `n` times: the selection spans from the first word's start to the last's end
-    const sweep = (step: (t: string, from: number) => Sel): Sel => {
+    const sweep = (s: Sel, step: (t: string, from: number) => Sel): Sel => {
       let first: Sel | undefined
-      let at = sel.head
+      let at = s.head
       for (let k = 0; k < n; k++) {
         const w = step(text, at)
         first ??= w
         if (w.head === at) break
         at = w.head
       }
-      return { anchor: isExtending ? sel.anchor : (first ?? caret(at)).anchor, head: at }
+      return { anchor: isExtending ? s.anchor : (first ?? caret(at)).anchor, head: at }
+    }
+
+    // Every occurrence of `ch` inside the selections becomes a selection of its own
+    const selectIn = (ch: string): Out => {
+      const found: Sel[] = []
+      let first = -1
+      sels.forEach((s, i) => {
+        const { lo, hi } = bounds(s)
+        for (let at = text.indexOf(ch, lo); ch !== '' && at !== -1 && at <= hi; at = text.indexOf(ch, at + 1)) {
+          if (i === primary && first === -1) first = found.length
+          found.push(caret(at))
+        }
+      })
+      return found.length === 0 ? keep() : commit(text, found, Math.max(first, 0))
     }
 
     if (waiting !== '' && key !== 'escape') {
@@ -344,115 +436,171 @@ export const register: Register = (on) => {
             // With a count, `gg` goes to that line
             let at = 0
             for (let k = 1; k < given && text.indexOf('\n', at) !== -1; k++) at = text.indexOf('\n', at) + 1
-            return keep(move(caret(Math.min(at, last))))
+            return each((s) => moveTo(s, Math.min(at, last)))
           }
           case 'e':
-            return keep(move(caret(last)))
+            return each((s) => moveTo(s, last))
           case 'h':
-            return keep(move(caret(lineStart(text, sel.head))))
+            return each((s) => moveTo(s, lineStart(text, s.head)))
           case 'l':
-            return keep(move(caret(lineLast(text, sel.head))))
+            return each((s) => moveTo(s, lineLast(text, s.head)))
           default:
-            return keep(sel)
+            return keep()
         }
       }
       if (waiting === 'm') {
         if (key === 'i' || key === 'a') {
           pending = key === 'i' ? 'mi' : 'ma'
-          return keep(sel)
+          return keep()
         }
-        const at = key === 'm' ? matchBracket(text, sel.head) : -1
-        return keep(at === -1 ? sel : move(caret(at)))
+        if (key !== 'm') return keep()
+        return each((s) => {
+          const at = matchBracket(text, s.head)
+          return at === -1 ? s : moveTo(s, at)
+        })
       }
       if (waiting === 'mi' || waiting === 'ma') {
-        return keep(textObject(text, sel.head, key, waiting === 'ma') ?? sel)
+        return each((s) => textObject(text, s.head, key, waiting === 'ma') ?? s)
       }
-      const at = key.length === 1 ? findChar(text, sel.head, key, waiting, n) : -1
-      if (at === -1) return keep(sel)
-      return keep({ anchor: isExtending ? sel.anchor : sel.head, head: at })
+      if (waiting === 's') return key.length === 1 ? selectIn(key) : keep()
+      if (key.length !== 1) return keep()
+      return each((s) => {
+        const at = findChar(text, s.head, key, waiting, n)
+        return at === -1 ? s : { anchor: isExtending ? s.anchor : s.head, head: at }
+      })
     }
 
     switch (key) {
       case 'h':
       case 'left':
-        return keep(move(caret(clamp(sel.head - n, 0, last))))
+        return each((s) => moveTo(s, clamp(s.head - n, 0, last)))
       case 'l':
       case 'right':
-        return keep(move(caret(clamp(sel.head + n, 0, last))))
+        return each((s) => moveTo(s, clamp(s.head + n, 0, last)))
       case 'j':
       case 'down':
-        return keep(move(caret(Array.from({ length: n }).reduce<number>((h) => vertical(text, h, 1), sel.head))))
+        return each((s) => moveTo(s, vertically(s.head, 1)))
       case 'k':
       case 'up':
-        return keep(move(caret(Array.from({ length: n }).reduce<number>((h) => vertical(text, h, -1), sel.head))))
+        return each((s) => moveTo(s, vertically(s.head, -1)))
       case '0':
-        return keep(move(caret(lineStart(text, sel.head))))
+        return each((s) => moveTo(s, lineStart(text, s.head)))
       case '$':
-        return keep(move(caret(lineLast(text, sel.head))))
+        return each((s) => moveTo(s, lineLast(text, s.head)))
       case 'w':
-        return keep(sweep(nextWord))
+        return each((s) => sweep(s, nextWord))
       case 'e':
-        return keep(sweep(wordEnd))
+        return each((s) => sweep(s, wordEnd))
       case 'b':
-        return keep(sweep(prevWord))
+        return each((s) => sweep(s, prevWord))
       case 'g':
       case 'm':
       case 'f':
       case 't':
       case 'F':
       case 'T':
+      case 's':
         pending = key
-        return keep(sel)
+        return keep()
       case '%':
-        return keep({ anchor: 0, head: last })
+        return commit(text, [{ anchor: 0, head: last }], 0)
       case 'x':
-        return keep(Array.from({ length: n }).reduce<Sel>((s) => selectLine(text, s), sel))
+        return each((s) => Array.from({ length: n }).reduce<Sel>((acc) => selectLine(text, acc), s))
       case 'v':
-        return { ...keep(sel), to: isExtending ? 'normal' : 'select' }
+        return { ...keep(), to: isExtending ? 'normal' : 'select' }
+      case ';':
+        return each((s) => caret(s.head))
+      case ',':
+        return commit(text, [main], 0)
+      case '(':
+      case ')':
+        return commit(text, sels, (primary + sels.length + (key === ')' ? 1 : -1)) % sels.length)
+      case 'C': {
+        // Copies the selections on the bottom line one line down, `n` times
+        let list = sels
+        let newPrimary = primary
+        for (let k = 0; k < n; k++) {
+          const tail = list[list.length - 1]
+          if (!tail) break
+          const bottom = lineStart(text, bounds(tail).hi)
+          const copies: Sel[] = []
+          for (const s of list) {
+            if (lineStart(text, bounds(s).hi) !== bottom) continue
+            const anchor = lineBelow(text, s.anchor)
+            const head = lineBelow(text, s.head)
+            if (anchor !== undefined && head !== undefined) copies.push({ anchor, head })
+          }
+          if (copies.length === 0) break
+          list = [...list, ...copies]
+          newPrimary = list.length - 1
+        }
+        return commit(text, list, newPrimary)
+      }
       case 'escape':
-        return { ...keep(caret(sel.head)), to: 'normal' }
+        return each((s) => caret(s.head), 'normal')
       case 'y':
-        yanked = text.slice(lo, hi + 1)
-        return { ...keep(caret(sel.head)), to: 'normal' }
+        yanked = sels.map((s) => text.slice(bounds(s).lo, bounds(s).hi + 1))
+        return each((s) => caret(s.head), 'normal')
       case 'd':
       case 'c': {
-        yanked = text.slice(lo, hi + 1)
-        const rest = text.slice(0, lo) + text.slice(hi + 1)
-        const head = clamp(lo, 0, rest.length - 1)
-        return { text: rest, cursor: lo, sel: caret(head), to: key === 'c' ? 'insert' : 'normal' }
+        yanked = sels.map((s) => text.slice(bounds(s).lo, bounds(s).hi + 1))
+        const cut = applyEdits(
+          text,
+          sels.map((s) => ({ start: bounds(s).lo, end: bounds(s).hi + 1, insert: '', anchorRel: 0, headRel: 0 })),
+        )
+        return commit(cut.text, cut.sels, primary, key === 'c' ? 'insert' : 'normal')
       }
       case 'p': {
-        if (yanked === '') return keep(sel)
-        const next = text.slice(0, hi + 1) + yanked + text.slice(hi + 1)
-        const pasted = { anchor: hi + 1, head: hi + yanked.length }
-        return { text: next, cursor: pasted.head, sel: pasted, to: 'normal' }
+        if (yanked.length === 0) return keep()
+        const pasted = applyEdits(
+          text,
+          sels.map((s, i) => {
+            // With fewer yanks than selections the last one repeats
+            const insert = yanked[i] ?? yanked[yanked.length - 1] ?? ''
+            const at = bounds(s).hi + 1
+            return { start: at, end: at, insert, anchorRel: 0, headRel: Math.max(insert.length - 1, 0) }
+          }),
+        )
+        return commit(pasted.text, pasted.sels, primary, 'normal')
       }
       case 'o': {
-        const end = lineEnd(text, hi)
-        const at = text.charAt(end) === '\n' ? end : text.length
-        return { text: text.slice(0, at) + '\n' + text.slice(at), cursor: at + 1, sel: caret(at + 1), to: 'insert' }
+        const opened = applyEdits(
+          text,
+          sels.map((s) => {
+            const end = lineEnd(text, bounds(s).hi)
+            const at = text.charAt(end) === '\n' ? end : text.length
+            return { start: at, end: at, insert: '\n', anchorRel: 1, headRel: 1 }
+          }),
+        )
+        return commit(opened.text, opened.sels, primary, 'insert')
       }
       case 'O': {
-        const at = lineStart(text, lo)
-        return { text: text.slice(0, at) + '\n' + text.slice(at), cursor: at, sel: caret(at), to: 'insert' }
+        const opened = applyEdits(
+          text,
+          sels.map((s) => {
+            const at = lineStart(text, bounds(s).lo)
+            return { start: at, end: at, insert: '\n', anchorRel: 0, headRel: 0 }
+          }),
+        )
+        return commit(opened.text, opened.sels, primary, 'insert')
       }
       case 'i':
-        return { ...keep(sel), cursor: lo, to: 'insert' }
+        return each((s) => caret(bounds(s).lo), 'insert')
       case 'a':
-        return { ...keep(sel), cursor: hi + 1, to: 'insert' }
+        return each((s) => caret(bounds(s).hi + 1), 'insert')
       case 'u':
       case 'U': {
         const [from, to] = key === 'u' ? [past, future] : [future, past]
-        let current: Box = { text, cursor: sel.head, sel }
+        let current: Box = { text, cursor: main.head, sels, primary }
         for (let k = 0; k < n; k++) {
           const snap = travel(from, to, current)
           if (!snap) break
-          current = { ...snap, cursor: snap.sel.head }
+          current = snap
         }
         return current
       }
       default:
-        return keep(sel)
+        return keep()
     }
   }
 
@@ -462,21 +610,71 @@ export const register: Register = (on) => {
     if (mode === 'insert') {
       // Escape may never reach this hook, so "jk" typed in a row leaves insert mode
       const isJk = raw === 'k' && e.inputText === 'k' && e.text.charAt(e.start - 1) === 'j' && !e.key?.ctrl
-      if (!isJk) return next(e)
+      // A cursor moved by something this mod did not see ends the multi-cursor edit
+      if (sels.length > 1 && (sels[primary] ?? caret(0)).head !== e.cursor) {
+        sels = [caret(e.cursor)]
+        primary = 0
+        if (hasNewLabel()) $.ui.status(label())
+      }
 
-      const text = e.text.slice(0, e.start - 1) + e.text.slice(e.start)
-      const head = clamp(e.start - 2, 0, text.length - 1)
-      sel = caret(head)
-      mode = 'normal'
-      $.ui.status(STATUS.normal)
-      return view({ text, cursor: head, sel })
+      if (sels.length === 1) {
+        if (!isJk) return next(e)
+
+        const text = e.text.slice(0, e.start - 1) + e.text.slice(e.start)
+        const head = clamp(e.start - 2, 0, text.length - 1)
+        sels = [caret(head)]
+        primary = 0
+        mode = 'normal'
+        if (hasNewLabel()) $.ui.status(label())
+        return view({ text, cursor: head, sels, primary })
+      }
+
+      // Several cursors: the edit the editor reports for the main one is made at every cursor
+      const carets = sels.map((s) => s.head)
+      let edits: Edit[]
+      if (isJk) {
+        edits = carets.map((c) => {
+          const at = e.text.charAt(c - 1) === 'j' ? c - 1 : c
+          return { start: at, end: c, insert: '', anchorRel: 0, headRel: 0 }
+        })
+      } else if (e.inputText === '' && e.start === e.end) {
+        const delta = e.start - e.cursor
+        const moved = normalize(carets.map((c) => caret(clamp(c + delta, 0, e.text.length))), primary)
+        sels = moved.sels
+        primary = moved.primary
+        if (hasNewLabel()) $.ui.status(label())
+        return view({ text: e.text, cursor: (sels[primary] ?? caret(0)).head, sels, primary })
+      } else {
+        const typed = e.inputText.length
+        edits = carets.map((c) => ({
+          start: clamp(c + e.start - e.cursor, 0, e.text.length),
+          end: clamp(c + e.end - e.cursor, 0, e.text.length),
+          insert: e.inputText,
+          anchorRel: typed,
+          headRel: typed,
+        }))
+      }
+      const edited = applyEdits(e.text, edits)
+      if (isJk) {
+        mode = 'normal'
+        const top = Math.max(edited.text.length - 1, 0)
+        const normal = normalize(edited.sels.map((s) => caret(clamp(s.head - 1, 0, top))), primary)
+        sels = normal.sels
+        primary = normal.primary
+      } else {
+        sels = edited.sels
+      }
+      if (hasNewLabel()) $.ui.status(label())
+      return view({ text: edited.text, cursor: (sels[primary] ?? caret(0)).head, sels, primary })
     }
 
     // Normal and select mode consume every key; unknown ones leave the draft untouched
     const text = e.text
     const key = e.key?.ctrl || e.key?.meta ? '' : e.key?.shift && raw.length === 1 ? raw.toUpperCase() : raw
-    sel = { anchor: clamp(sel.anchor, 0, text.length - 1), head: clamp(sel.head, 0, text.length - 1) }
-    const before: Box = { text, cursor: sel.head, sel }
+    const top = Math.max(text.length - 1, 0)
+    sels = sels.map((s) => ({ anchor: clamp(s.anchor, 0, top), head: clamp(s.head, 0, top) }))
+    primary = clamp(primary, 0, sels.length - 1)
+    const before: Box = { text, cursor: (sels[primary] ?? caret(0)).head, sels, primary }
     const isTravel = pending === '' && (key === 'u' || key === 'U')
     const out = command(key, text)
 
@@ -487,21 +685,20 @@ export const register: Register = (on) => {
       if (past.length > HISTORY_LIMIT) past.shift()
     }
 
-    sel = out.sel
-    if (out.to) {
-      mode = out.to
-      $.ui.status(STATUS[out.to])
-    }
+    sels = out.sels
+    primary = out.primary
+    if (out.to) mode = out.to
+    if (hasNewLabel()) $.ui.status(label())
     return view(out)
   })
 
   on('prompt.submit', ($, e, next) => {
     past.length = 0
     future.length = 0
-    if (mode !== 'insert') {
-      mode = 'insert'
-      $.ui.status(STATUS.insert)
-    }
+    sels = [caret(0)]
+    primary = 0
+    mode = 'insert'
+    if (hasNewLabel()) $.ui.status(label())
     return next(e)
   })
 }
