@@ -8,8 +8,9 @@ type Out = Box & { to?: Mode }
 // Replaces [start, end) with `insert`; the selection lands relative to where `insert` begins
 type Edit = { start: number; end: number; insert: string; anchorRel: number; headRel: number }
 // A key that waits for the next one: `g` goto, `m` match (`mi`/`ma` then pick a text object),
-// `f`/`t`/`F`/`T` find a character, `s` select every occurrence of one inside the selections
-type Pending = '' | 'g' | 'm' | 'mi' | 'ma' | 'f' | 't' | 'F' | 'T' | 's'
+// `f`/`t`/`F`/`T` find a character, `s` select every occurrence of one inside the selections,
+// `r` replace the selected characters with one
+type Pending = '' | 'g' | 'm' | 'mi' | 'ma' | 'f' | 't' | 'F' | 'T' | 's' | 'r'
 
 const PRIMARY = { backgroundColor: 'blue' } as const
 const SECONDARY = { backgroundColor: 'cyan' } as const
@@ -19,6 +20,7 @@ const STATUS: Record<Mode, string | undefined> = {
   select: '-- SELECT --',
 }
 const HISTORY_LIMIT = 100
+const INDENT = '  '
 const PAIRS = new Map([
   ['(', ')'],
   ['[', ']'],
@@ -315,6 +317,35 @@ function applyEdits(t: string, edits: Edit[]): { text: string; sels: Sel[] } {
   return { text: text + t.slice(at), sels }
 }
 
+// The lines of `region` joined: each line break and the blanks after it become one space, or
+// nothing before a blank line or the end (`after` is the character that follows the region)
+function joinLines(region: string, after: string): string {
+  let out = ''
+  for (let i = 0; i < region.length; i++) {
+    if (region.charAt(i) !== '\n') {
+      out += region.charAt(i)
+      continue
+    }
+    let j = i + 1
+    while (isBlank(region.charAt(j))) j++
+    const next = j < region.length ? region.charAt(j) : after
+    out += next === '\n' || next === '' ? '' : ' '
+    i = j - 1
+  }
+  return out
+}
+
+// Every non-empty line of `region` indented by one level, or outdented by up to one
+function shiftLines(region: string, isIndent: boolean): string {
+  return region
+    .split('\n')
+    .map((line) => {
+      if (isIndent) return line === '' ? line : INDENT + line
+      return line.startsWith('\t') ? line.slice(1) : line.replace(/^ {1,2}/, '')
+    })
+    .join('\n')
+}
+
 // The same column one line down, or undefined on the last line
 function lineBelow(t: string, i: number): number | undefined {
   const nl = t.indexOf('\n', i)
@@ -396,7 +427,7 @@ export const register: Register = (on) => {
       return keep()
     }
     // The count rides through a prefix key (`3gg`, `2fx`) and is spent by the key that completes it
-    if (waiting !== '' || !'gmftFTs'.includes(key) || key === '') count = 0
+    if (waiting !== '' || !'gmftFTsr'.includes(key) || key === '') count = 0
     const n = Math.max(given, 1)
 
     const vertically = (head: number, dir: 1 | -1) =>
@@ -427,6 +458,28 @@ export const register: Register = (on) => {
         }
       })
       return found.length === 0 ? keep() : commit(text, found, Math.max(first, 0))
+    }
+
+    // Replaces the text around every selection (by default the selection itself) with `fn` of it;
+    // each selection then spans the new text
+    const rewrite = (fn: (region: string, after: string) => string, span?: (lo: number, hi: number) => number[]): Out => {
+      const done = applyEdits(
+        text,
+        sels.map((s) => {
+          const { lo, hi } = bounds(s)
+          const [start = lo, end = hi + 1] = span ? span(lo, hi) : [lo, hi + 1]
+          const insert = fn(text.slice(start, end), text.charAt(end))
+          const tail = Math.max(insert.length - 1, 0)
+          const isForward = s.anchor <= s.head
+          return { start, end, insert, anchorRel: isForward ? 0 : tail, headRel: isForward ? tail : 0 }
+        }),
+      )
+      return commit(done.text, done.sels, primary)
+    }
+    const afterBlanks = (i: number) => {
+      let end = i
+      while (isBlank(text.charAt(end))) end++
+      return end
     }
 
     if (waiting !== '' && key !== 'escape') {
@@ -463,6 +516,9 @@ export const register: Register = (on) => {
         return each((s) => textObject(text, s.head, key, waiting === 'ma') ?? s)
       }
       if (waiting === 's') return key.length === 1 ? selectIn(key) : keep()
+      if (waiting === 'r') {
+        return key.length === 1 ? rewrite((region) => Array.from(region, (c) => (c === '\n' ? c : key)).join('')) : keep()
+      }
       if (key.length !== 1) return keep()
       return each((s) => {
         const at = findChar(text, s.head, key, waiting, n)
@@ -500,8 +556,29 @@ export const register: Register = (on) => {
       case 'F':
       case 'T':
       case 's':
+      case 'r':
         pending = key
         return keep()
+      case '~':
+        return rewrite((region) => Array.from(region, (c) => (c === c.toUpperCase() ? c.toLowerCase() : c.toUpperCase())).join(''))
+      case 'J':
+        return rewrite(joinLines, (lo, hi) => {
+          if (text.slice(lo, hi + 1).includes('\n')) return [lo, text.charAt(hi) === '\n' ? afterBlanks(hi + 1) : hi + 1]
+          // A selection inside one line joins that line to the next
+          const nl = text.indexOf('\n', hi)
+          return [lo, nl === -1 ? hi + 1 : afterBlanks(nl + 1)]
+        })
+      case '>':
+      case '<':
+        return rewrite(
+          (region) => shiftLines(region, key === '>'),
+          (lo, hi) => {
+            const nl = text.indexOf('\n', hi)
+            return [lineStart(text, lo), nl === -1 ? text.length : nl]
+          },
+        )
+      case '*':
+        return each((s) => textObject(text, s.head, 'w', false) ?? s)
       case '%':
         return commit(text, [{ anchor: 0, head: last }], 0)
       case 'x':

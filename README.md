@@ -35,6 +35,11 @@ The prompt starts in **insert** mode. Type `jk` to enter **normal** mode (`Esc` 
 | `i` `a` | insert before / after the selection |
 | `o` `O` | open a line below / above and insert |
 | `u` `U` | undo / redo (an insert session is one step) |
+| `r` + char | replace every selected character with the char |
+| `~` | swap the case of the selection |
+| `J` | join the selected lines (or this line with the next) |
+| `>` `<` | indent / outdent the selected lines |
+| `*` | select the word under the cursor |
 | `s` + char | select every occurrence of the char inside the selections |
 | `C` | copy the selection to the next line (repeat or `3C` for more lines) |
 | `;` `,` | collapse the selections to cursors / keep only the primary one |
@@ -54,6 +59,16 @@ Unknown keys in normal mode are ignored.
 - Undo history lives in the mod and resets when the prompt is submitted.
 - Words are Unicode-aware (`ação` is one word); surrogate pairs (emoji) are not handled.
 - Mod API is early access and may change between Claude Code releases.
+
+## Development
+
+```sh
+make test      # behaviour tests: they drive the hooks the way the editor does (Node 22.18+)
+make check     # type-check against the engine's declarations
+make validate  # claude plugin validate
+```
+
+Run it from the repo while editing with `claude --plugin-dir .`. Bump `version` in `.claude-plugin/plugin.json` on each behaviour change, or `/plugin update` will not notice it.
 
 ## License
 
