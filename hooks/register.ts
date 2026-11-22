@@ -37,6 +37,7 @@ const OBJECT_PAIRS = new Map<string, readonly [string, string]>([
   ['>', ['<', '>']],
 ])
 
+const isBlank = (c: string) => c === ' ' || c === '\t'
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n))
 const isSpace = (c: string) => /\s/.test(c)
 const isWord = (c: string) => /[\p{L}\p{M}\p{N}_]/u.test(c)
@@ -56,13 +57,26 @@ const lineLast = (t: string, i: number) => {
 const bounds = (s: Sel) => ({ lo: Math.min(s.anchor, s.head), hi: Math.max(s.anchor, s.head) })
 const caret = (head: number): Sel => ({ anchor: head, head })
 
+// What a character counts as for word motions: 0 blank, 1 word, 2 punctuation, 3 newline
+const kindOf = (c: string) => (c === '\n' ? 3 : isSpace(c) ? 0 : isWord(c) ? 1 : 2)
+
+// Helix's `w`: the word or punctuation run, with the blanks after it. Mid-word the selection
+// starts at the cursor; from a word's last character, or from blanks, it starts at the next one.
 function nextWord(t: string, from: number): Sel {
-  let i = from + 1
-  while (i < t.length && isSpace(t.charAt(i))) i++
-  if (i >= t.length) return caret(t.length - 1)
-  const start = i
-  while (i + 1 < t.length && !isSpace(t.charAt(i + 1)) && isWord(t.charAt(i + 1)) === isWord(t.charAt(start))) i++
-  return { anchor: start, head: i }
+  if (from + 1 >= t.length) return caret(t.length - 1)
+  const k = kindOf(t.charAt(from))
+  const isRun = k === 1 || k === 2
+  const isMidWord = isRun && kindOf(t.charAt(from + 1)) === k
+  // A one-character word followed by blanks is still a whole word, and taking them moves on
+  const isLone = isRun && !isMidWord && kindOf(t.charAt(from - 1)) !== k && isBlank(t.charAt(from + 1))
+  const anchor = isMidWord || isLone ? from : from + 1
+  const kind = kindOf(t.charAt(anchor))
+  let head = anchor
+  while (head + 1 < t.length && kindOf(t.charAt(head + 1)) === kind) head++
+  if (kind === 1 || kind === 2) {
+    while (isBlank(t.charAt(head + 1))) head++
+  }
+  return { anchor, head }
 }
 
 function wordEnd(t: string, from: number): Sel {
@@ -117,8 +131,6 @@ function findChar(t: string, from: number, ch: string, kind: 'f' | 't' | 'F' | '
   }
   return kind === 't' ? at - 1 : kind === 'T' ? at + 1 : at
 }
-
-const isBlank = (c: string) => c === ' ' || c === '\t'
 
 // The word, or with `isBig` the run of non-space, under `at`; `around` takes the spaces after it
 // (before it when none follow)
